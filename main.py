@@ -1,53 +1,41 @@
 import discord
-import requests
-import asyncio
+from discord import app_commands
 import os
-from datetime import datetime
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 intents = discord.Intents.default()
-intents.message_content = True
-
 client = discord.Client(intents=intents)
-
-CHANNEL_ID = 1475935692537204860 # replace with your channel ID
-
-
-async def fetch_trending():
-    # Placeholder – we’ll improve this later
-    return [
-        {"name": "Example Item", "rap": 600, "lowest": 465, "change": "+12%"},
-        {"name": "Example Item 2", "rap": 320, "lowest": 305, "change": "+3%"},
-    ]
-
-
-async def post_trending():
-    await client.wait_until_ready()
-    channel = client.get_channel(CHANNEL_ID)
-
-    while not client.is_closed():
-        items = await fetch_trending()
-
-        message = f"📈 Trending Update ({datetime.now().strftime('%H:%M')})\n\n"
-
-        for item in items:
-            message += (
-                f"**{item['name']}**\n"
-                f"RAP: {item['rap']}\n"
-                f"Lowest: {item['lowest']}\n"
-                f"24h Change: {item['change']}\n\n"
-            )
-
-        await channel.send(message)
-
-        await asyncio.sleep(3600)  # 1 hour
+tree = app_commands.CommandTree(client)
 
 
 @client.event
 async def on_ready():
+    await tree.sync()
     print(f"Logged in as {client.user}")
-    client.loop.create_task(post_trending())
+
+
+@tree.command(name="profit", description="Calculate profit after Roblox tax")
+@app_commands.describe(buy_price="Price you bought the item for",
+                       sell_price="Current lowest sell price")
+async def profit(interaction: discord.Interaction, buy_price: float, sell_price: float):
+
+    net = sell_price * 0.7
+    profit_value = net - buy_price
+    roi = (profit_value / buy_price) * 100
+
+    embed = discord.Embed(
+        title="📈 Profit Calculator",
+        color=discord.Color.green()
+    )
+
+    embed.add_field(name="Buy Price", value=f"{buy_price}", inline=True)
+    embed.add_field(name="Sell Price", value=f"{sell_price}", inline=True)
+    embed.add_field(name="After Tax (70%)", value=f"{net:.2f}", inline=False)
+    embed.add_field(name="Profit", value=f"{profit_value:.2f}", inline=True)
+    embed.add_field(name="ROI %", value=f"{roi:.2f}%", inline=True)
+
+    await interaction.response.send_message(embed=embed)
 
 
 client.run(TOKEN)
