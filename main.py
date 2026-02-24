@@ -11,7 +11,7 @@ intents.message_content = True
 
 client = discord.Client(intents=intents)
 
-CHANNEL_ID = 123456789012345678  # replace with your channel ID
+CHANNEL_ID = 1475935692537204860 # replace with your channel ID
 
 
 async def fetch_trending():
