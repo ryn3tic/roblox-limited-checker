@@ -1,7 +1,7 @@
 import os
 import asyncio
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 
 import aiohttp
 import discord
@@ -18,10 +18,9 @@ AUTO_TOP_N = 10
 AUTO_MIN_RAP = 0
 AUTO_MIN_GAP = -999
 AUTO_MODE = "gap"
-ANALYZE_LIMIT = 50
 SCAN_INTERVAL = 3600
 
-MAX_CONCURRENT = 10
+MAX_CONCURRENT = 15
 
 # ==========================================
 
@@ -29,57 +28,62 @@ intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-
 # ================= DATA ===================
 
-async def fetch_collectible_assets(session: aiohttp.ClientSession, max_price: int) -> List[int]:
+async def fetch_rolimons_limiteds(session: aiohttp.ClientSession) -> Dict[int, Dict[str, Any]]:
     """
-    Fetch resale-enabled collectibles directly.
+    Get all limited items from Rolimon's API.
     """
-    url = (
-        "https://catalog.roblox.com/v1/search/items"
-        f"?category=Collectibles"
-        f"&salesTypeFilter=2"
-        f"&limit={ANALYZE_LIMIT}"
-        f"&minPrice=0"
-        f"&maxPrice={max_price}"
-        f"&sortType=3"
-    )
+    url = "https://www.rolimons.com/itemapi/itemdetails"
 
-    headers = {"User-Agent": "LimitedScannerBot/1.0"}
-
-    async with session.get(url, headers=headers, timeout=20) as r:
-        if r.status != 200:
-            return []
+    async with session.get(url, timeout=30) as r:
         data = await r.json()
 
-    ids = []
-    for item in data.get("data", []):
-        if item.get("itemType") == "Asset":
-            ids.append(item["id"])
+    items = {}
 
-    return ids
+    for asset_id, info in data.get("items", {}).items():
+        try:
+            aid = int(asset_id)
+            name = info[0]
+            rap = info[2]
+            value = info[3]
+            limited_flag = info[5]
+
+            # limited_flag: 1 = limited, 2 = limitedU
+            if limited_flag in (1, 2):
+                items[aid] = {
+                    "name": name,
+                    "rap": rap,
+                    "value": value,
+                }
+        except Exception:
+            continue
+
+    return items
 
 
 async def fetch_resale(session: aiohttp.ClientSession, asset_id: int) -> Optional[Dict[str, Any]]:
     url = f"https://economy.roblox.com/v1/assets/{asset_id}/resale-data"
-    headers = {"User-Agent": "LimitedScannerBot/1.0"}
 
-    async with session.get(url, headers=headers, timeout=20) as r:
+    async with session.get(url, timeout=20) as r:
         if r.status != 200:
             return None
         data = await r.json()
 
-    rap = data.get("recentAveragePrice")
     lowest = data.get("lowestResalePrice")
+    rap = data.get("recentAveragePrice")
+    num_sellers = data.get("numSellers")
 
-    if not isinstance(rap, (int, float)) or not isinstance(lowest, (int, float)):
+    if not isinstance(lowest, (int, float)):
+        return None
+
+    if lowest <= 0:
         return None
 
     return {
-        "id": asset_id,
-        "rap": float(rap),
         "lowest": float(lowest),
+        "rap": float(rap) if isinstance(rap, (int, float)) else 0,
+        "num_sellers": num_sellers,
     }
 
 
@@ -89,8 +93,7 @@ def compute_gap(rap: float, lowest: float) -> float:
     return (rap - lowest) / rap * 100
 
 
-def risk_rating(rap: float, lowest: float) -> str:
-    gap = compute_gap(rap, lowest)
+def risk_rating(gap: float) -> str:
     if gap < -20:
         return "High"
     if -20 <= gap < 0:
@@ -100,8 +103,7 @@ def risk_rating(rap: float, lowest: float) -> str:
     return "Medium"
 
 
-def score_item(rap: float, lowest: float, mode: str) -> float:
-    gap = compute_gap(rap, lowest)
+def score_item(gap: float, mode: str) -> float:
     if mode == "gap":
         return gap
     if mode == "momentum":
@@ -109,45 +111,57 @@ def score_item(rap: float, lowest: float, mode: str) -> float:
     return gap - abs(gap) * 0.2
 
 
-async def run_scan(max_price: int, top_n: int, min_rap: int, min_gap: float, mode: str):
+async def run_scan(max_price, top_n, min_rap, min_gap, mode):
     async with aiohttp.ClientSession() as session:
-        candidates = await fetch_collectible_assets(session, max_price)
+
+        rolimons_items = await fetch_rolimons_limiteds(session)
 
         sem = asyncio.Semaphore(MAX_CONCURRENT)
         results = []
 
-        async def worker(aid):
+        async def worker(asset_id, item_info):
             async with sem:
-                data = await fetch_resale(session, aid)
-                if data:
-                    results.append(data)
+                resale = await fetch_resale(session, asset_id)
+                if not resale:
+                    return
 
-        await asyncio.gather(*(worker(a) for a in candidates))
+                lowest = resale["lowest"]
+                rap = resale["rap"]
 
-        filtered = []
-        for item in results:
-            if item["lowest"] > max_price:
-                continue
-            if item["rap"] < min_rap:
-                continue
+                if lowest > max_price:
+                    return
+                if rap < min_rap:
+                    return
 
-            gap = compute_gap(item["rap"], item["lowest"])
-            if gap < min_gap:
-                continue
+                gap = compute_gap(rap, lowest)
+                if gap < min_gap:
+                    return
 
-            item["gap"] = gap
-            item["risk"] = risk_rating(item["rap"], item["lowest"])
-            item["score"] = score_item(item["rap"], item["lowest"], mode)
-            filtered.append(item)
+                results.append({
+                    "id": asset_id,
+                    "name": item_info["name"],
+                    "lowest": lowest,
+                    "rap": rap,
+                    "gap": gap,
+                    "risk": risk_rating(gap),
+                    "score": score_item(gap, mode),
+                })
 
-        filtered.sort(key=lambda x: x["score"], reverse=True)
+        tasks = [
+            worker(aid, info)
+            for aid, info in rolimons_items.items()
+        ]
 
-        return filtered[:min(top_n, 25)], len(candidates), len(filtered)
+        await asyncio.gather(*tasks)
+
+        results.sort(key=lambda x: x["score"], reverse=True)
+
+        return results[:min(top_n, 25)], len(rolimons_items), len(results)
 
 
 # ================= EMBED ==================
 
-def build_embed(items, candidates, scored, params, trigger):
+def build_embed(items, total, qualified, params, trigger):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     embed = discord.Embed(
@@ -158,7 +172,7 @@ def build_embed(items, candidates, scored, params, trigger):
 
     embed.add_field(
         name="Summary",
-        value=f"Candidates: {candidates}\nQualified: {scored}",
+        value=f"Total Limiteds: {total}\nQualified: {qualified}",
         inline=False
     )
 
@@ -168,7 +182,7 @@ def build_embed(items, candidates, scored, params, trigger):
 
     for i, item in enumerate(items, 1):
         embed.add_field(
-            name=f"{i}. Asset {item['id']}",
+            name=f"{i}. {item['name']}",
             value=f"Lowest: {int(item['lowest'])} | RAP: {int(item['rap'])}\nGap: {item['gap']:.1f}% | Risk: {item['risk']}",
             inline=False
         )
@@ -186,12 +200,12 @@ async def post_scan(trigger, max_price, top_n, min_rap, min_gap, mode):
     if not channel:
         return
 
-    items, candidates, scored = await run_scan(max_price, top_n, min_rap, min_gap, mode)
+    items, total, qualified = await run_scan(max_price, top_n, min_rap, min_gap, mode)
 
     embed = build_embed(
         items,
-        candidates,
-        scored,
+        total,
+        qualified,
         {
             "max_price": max_price,
             "min_rap": min_rap,
