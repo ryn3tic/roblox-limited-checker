@@ -805,10 +805,18 @@ async def item_cmd(interaction: discord.Interaction, name: str):
 
 # ================== STARTUP ==================
 
+
 @client.event
 async def on_ready():
     guild = discord.Object(id=GUILD_ID)
+    
+    # Clear all old commands first
+    tree.clear_commands(guild=guild)
     await tree.sync(guild=guild)
+    
+    # Now register and sync the new ones
+    await tree.sync(guild=guild)
+    
     print(f"✅ {client.user} is online — commands synced to guild {GUILD_ID}")
     client.loop.create_task(hourly_loop())
 
