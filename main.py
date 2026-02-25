@@ -13,7 +13,7 @@ TOKEN      = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 GUILD_ID   = 1475935690465480979
 
-AUTO_MAX_PRICE  = 10_000
+AUTO_MAX_PRICE  = 200     # only show limiteds with RAP under 200 R$
 AUTO_TOP_N      = 10
 AUTO_MIN_RAP    = 0
 AUTO_MIN_GAP    = 0
@@ -77,15 +77,17 @@ async def fetch_rolimons_raw(session: aiohttp.ClientSession) -> Dict[int, Dict]:
             rap   = float(info[2]) if isinstance(info[2], (int, float)) and info[2] > 0 else 0.0
             value = float(info[3]) if isinstance(info[3], (int, float)) and info[3] > 0 else 0.0
             lookup[aid] = {
-                "id":        aid,
-                "name":      info[0],
-                "rap":       rap,
-                "value":     value,
-                "demand":    int(info[5]) if isinstance(info[5], int) else 0,
-                "trend":     int(info[6]) if isinstance(info[6], int) else 0,
-                "projected": info[7] == 1,
-                "hyped":     info[8] == 1,
-                "rare":      info[9] == 1,
+                "id":           aid,
+                "name":         info[0],
+                "rap":          rap,
+                "value":        value,
+                # index 4 = default_value. Rolimons uses -1 here for Limited U (unique copy-count items)
+                "limited_type": "U 🔢" if info[4] == -1 else "L ⏱️",
+                "demand":       int(info[5]) if isinstance(info[5], int) else 0,
+                "trend":        int(info[6]) if isinstance(info[6], int) else 0,
+                "projected":    info[7] == 1,
+                "hyped":        info[8] == 1,
+                "rare":         info[9] == 1,
             }
         except Exception:
             continue
@@ -353,19 +355,20 @@ async def run_scan(max_price, top_n, min_rap, min_gap, mode):
 # ================== EMBED HELPERS ==================
 
 def _item_line(item: Dict) -> str:
-    d_icon = DEMAND_ICONS.get(item.get("demand", 0), "")
-    t_icon = TREND_ICONS.get(item.get("trend", 0), "")
-    d_lbl  = DEMAND_LABELS.get(item.get("demand", 0), "?")
-    t_lbl  = TREND_LABELS.get(item.get("trend", 0), "?")
-    tags   = ("🔥" if item.get("hyped") else "") + ("💎" if item.get("rare") else "")
-    sale   = f"  |  **On Sale: {item['sale_price']} R$**" if item.get("sale_price") else ""
+    d_icon   = DEMAND_ICONS.get(item.get("demand", 0), "")
+    t_icon   = TREND_ICONS.get(item.get("trend", 0), "")
+    d_lbl    = DEMAND_LABELS.get(item.get("demand", 0), "?")
+    t_lbl    = TREND_LABELS.get(item.get("trend", 0), "?")
+    tags     = ("🔥" if item.get("hyped") else "") + ("💎" if item.get("rare") else "")
+    sale     = f"  |  **On Sale: {item['sale_price']} R$**" if item.get("sale_price") else ""
+    lim_type = item.get("limited_type", "")
 
     stock_str = ""
     if item.get("stock_remaining") is not None:
         stock_str = f"  |  Stock: **{item['stock_remaining']}** left"
 
     return (
-        f"RAP: **{int(item['rap'])}** | Value: **{int(item['value'])}** | "
+        f"{lim_type}  RAP: **{int(item['rap'])}** | Value: **{int(item['value'])}** | "
         f"Gap: **{item['gap']:.1f}%**{sale}{stock_str} {tags}\n"
         f"{d_icon} {d_lbl}  {t_icon} {t_lbl}\n"
         f"🔗 [Rolimons](https://www.rolimons.com/item/{item['id']})  "
@@ -671,7 +674,7 @@ async def hourly_loop():
 # ================== SLASH COMMANDS ==================
 
 @tree.command(name="scan", description="Scan for undervalued limiteds (below community value)", guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(max_price="Max RAP in Robux", min_gap="Min gap % between RAP and value", mode="Sort by: gap or score")
+@app_commands.describe(max_price="Max RAP in Robux (default 200)", min_gap="Min gap % between RAP and value", mode="Sort by: gap or score")
 async def scan_cmd(interaction: discord.Interaction, max_price: int = AUTO_MAX_PRICE, min_gap: int = AUTO_MIN_GAP, mode: str = AUTO_MODE):
     await interaction.response.send_message("🔎 Scanning...", ephemeral=True)
     await post_undervalue(f"Manual scan by {interaction.user}", max_price, AUTO_TOP_N, AUTO_MIN_RAP, min_gap, mode)
@@ -805,18 +808,10 @@ async def item_cmd(interaction: discord.Interaction, name: str):
 
 # ================== STARTUP ==================
 
-
 @client.event
 async def on_ready():
     guild = discord.Object(id=GUILD_ID)
-    
-    # Clear all old commands first
-    tree.clear_commands(guild=guild)
     await tree.sync(guild=guild)
-    
-    # Now register and sync the new ones
-    await tree.sync(guild=guild)
-    
     print(f"✅ {client.user} is online — commands synced to guild {GUILD_ID}")
     client.loop.create_task(hourly_loop())
 
