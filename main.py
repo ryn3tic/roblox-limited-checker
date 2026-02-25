@@ -287,6 +287,9 @@ async def fetch_new_releases(session: aiohttp.ClientSession, count: int = NEW_IT
 def compute_gap(rap: float, value: float) -> float:
     if value <= 0:
         return 0.0
+    if rap <= 0:
+        # No RAP data — can't calculate a real gap, return 0 (neutral)
+        return 0.0
     return (value - rap) / value * 100
 
 
@@ -301,6 +304,90 @@ def score_item(item: Dict[str, Any]) -> float:
     if item.get("rare"):      bonus += 5
     if item.get("projected"): bonus -= 5
     return gap + d_score + t_score + bonus
+
+
+def growth_score(item):
+    """
+    Estimates probability of an item gaining value / RAP over time.
+    Separate from buy score — purely focused on future growth signals.
+
+    Weights:
+      Trend raising  +40  (strongest signal — price already moving)
+      Trend stable   +15  (holding value is healthy)
+      Trend lowering -20  (bad sign)
+      Demand amazing +30  (high demand pushes RAP up over time)
+      Demand high    +20
+      Demand normal  +10
+      Demand low     -10
+      Demand terrible-25  (almost no hope of RAP growth)
+      Hyped          +20  (hype drives short-term RAP spikes)
+      Rare           +25  (scarcity = long-term value growth)
+      Projected      -10  (unconfirmed value = risky)
+      Gap > 20%      +15  (community already sees upside)
+      Gap 10-20%     +8
+      Limited U      +10  (copy-count items hold/grow better)
+    """
+    score  = 0.0
+    trend  = item.get("trend", 0)
+    demand = item.get("demand", 0)
+    gap    = item.get("gap", 0.0)
+
+    if trend == 3:        score += 40
+    elif trend == 2:      score += 15
+    elif trend == 1:      score -= 20
+
+    if demand == 5:       score += 30
+    elif demand == 4:     score += 20
+    elif demand == 3:     score += 10
+    elif demand == 2:     score -= 10
+    elif demand == 1:     score -= 25
+
+    if item.get("rare"):      score += 25
+    if item.get("hyped"):     score += 20
+    if item.get("projected"): score -= 10
+
+    if gap >= 20:    score += 15
+    elif gap >= 10:  score += 8
+
+    if item.get("limited_type", "").startswith("U"):
+        score += 10
+
+    return score
+
+
+def growth_reason(item):
+    parts = []
+    trend  = item.get("trend", 0)
+    demand = item.get("demand", 0)
+    gap    = item.get("gap", 0.0)
+
+    if trend == 3:    parts.append("📈 price **actively rising**")
+    elif trend == 2:  parts.append("➡️ price **stable**")
+    elif trend == 1:  parts.append("⚠️ price **lowering**")
+
+    if demand >= 4:   parts.append(f"🟢 demand **{DEMAND_LABELS[demand]}**")
+    elif demand == 3: parts.append("🟡 demand **Normal**")
+    elif 0 < demand <= 2: parts.append(f"⚠️ demand **{DEMAND_LABELS[demand]}**")
+
+    if item.get("rare"):  parts.append("💎 rare")
+    if item.get("hyped"): parts.append("🔥 hyped")
+    if gap >= 10:         parts.append(f"value {gap:.0f}% above RAP")
+
+    return " · ".join(parts) if parts else "No strong growth signals."
+
+
+async def run_growth_scan(top_n=10):
+    async with aiohttp.ClientSession() as session:
+        all_items = await fetch_rolimons_list(session)
+    results = []
+    for item in all_items:
+        if item["value"] <= 0 and item["rap"] <= 0:
+            continue
+        item["gap"]          = compute_gap(item["rap"], item["value"])
+        item["growth_score"] = growth_score(item)
+        results.append(item)
+    results.sort(key=lambda x: x["growth_score"], reverse=True)
+    return results[:top_n]
 
 
 def buy_reason(item: Dict[str, Any]) -> str:
@@ -338,7 +425,16 @@ def buy_reason(item: Dict[str, Any]) -> str:
 async def run_scan(max_price, top_n, min_rap, min_gap, mode):
     async with aiohttp.ClientSession() as session:
         all_items = await fetch_rolimons_list(session)
-    candidates = [i for i in all_items if i["rap"] > 0 and i["rap"] <= max_price and i["rap"] >= min_rap]
+    candidates = [
+        i for i in all_items
+        if (
+            # Item has a RAP and it's within range
+            (i["rap"] > 0 and i["rap"] <= max_price and i["rap"] >= min_rap)
+            or
+            # Item has no RAP yet but its community value is within range
+            (i["rap"] == 0 and i["value"] > 0 and i["value"] <= max_price)
+        )
+    ]
     results = []
     for item in candidates:
         gap = compute_gap(item["rap"], item["value"])
@@ -354,98 +450,134 @@ async def run_scan(max_price, top_n, min_rap, min_gap, mode):
 
 # ================== EMBED HELPERS ==================
 
-def _item_line(item: Dict) -> str:
-    d_icon   = DEMAND_ICONS.get(item.get("demand", 0), "")
-    t_icon   = TREND_ICONS.get(item.get("trend", 0), "")
-    d_lbl    = DEMAND_LABELS.get(item.get("demand", 0), "?")
-    t_lbl    = TREND_LABELS.get(item.get("trend", 0), "?")
-    tags     = ("🔥" if item.get("hyped") else "") + ("💎" if item.get("rare") else "")
-    sale     = f"  |  **On Sale: {item['sale_price']} R$**" if item.get("sale_price") else ""
-    lim_type = item.get("limited_type", "")
+def _fmt_item(item, rank=0, show_score=False, score_key="score"):
+    """Returns (name, value) for a Discord embed field — consistent layout for all scan types."""
+    lim     = item.get("limited_type", "")
+    tags    = ("🔥 " if item.get("hyped") else "") + ("💎 " if item.get("rare") else "")
+    d_icon  = DEMAND_ICONS.get(item.get("demand", 0), "")
+    t_icon  = TREND_ICONS.get(item.get("trend", 0), "")
+    d_lbl   = DEMAND_LABELS.get(item.get("demand", 0), "?")
+    t_lbl   = TREND_LABELS.get(item.get("trend", 0), "?")
 
-    stock_str = ""
-    if item.get("stock_remaining") is not None:
-        stock_str = f"  |  Stock: **{item['stock_remaining']}** left"
+    rap_str   = f"{int(item['rap']):,}"   if item.get("rap")   else "—"
+    val_str   = f"{int(item['value']):,}" if item.get("value") else "—"
+    gap_str   = f"{item['gap']:.1f}%"     if item.get("gap") is not None else "—"
+    sale_str  = f"  ·  🏷️ **{item['sale_price']:,} R$**"      if item.get("sale_price")       else ""
+    stock_str = f"  ·  📦 {item['stock_remaining']} left"      if item.get("stock_remaining") is not None else ""
+    score_str = f"  ·  ⭐ {item[score_key]:.0f}"               if show_score                   else ""
 
-    return (
-        f"{lim_type}  RAP: **{int(item['rap'])}** | Value: **{int(item['value'])}** | "
-        f"Gap: **{item['gap']:.1f}%**{sale}{stock_str} {tags}\n"
-        f"{d_icon} {d_lbl}  {t_icon} {t_lbl}\n"
-        f"🔗 [Rolimons](https://www.rolimons.com/item/{item['id']})  "
-        f"• [Roblox](https://www.roblox.com/catalog/{item['id']})"
-    )
+    price_line  = f"`RAP` {rap_str}  `Val` {val_str}  `Gap` {gap_str}{sale_str}{stock_str}{score_str}"
+    signal_line = f"{d_icon} {d_lbl}  {t_icon} {t_lbl}  {tags}".strip()
+    link_line   = f"[Rolimons](https://www.rolimons.com/item/{item['id']}) · [Roblox](https://www.roblox.com/catalog/{item['id']})"
+
+    prefix = f"`#{rank}`  " if rank else ""
+    name   = f"{prefix}{item['name']}  {lim}".strip()
+    value  = f"{price_line}\n{signal_line}\n{link_line}"
+    return name, value
 
 
 def build_undervalue_embed(items, scanned, qualified, max_price, trigger):
-    now   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now   = datetime.now(timezone.utc).strftime("%d %b %Y · %H:%M UTC")
     embed = discord.Embed(
-        title=f"📈 Undervalue Scan — RAP ≤ {max_price:,} R$",
-        description=f"{trigger}\n{now}",
-        color=discord.Color.green(),
+        title="📈  Undervalue Scan",
+        description=f"RAP ≤ **{max_price:,} R$**  ·  {now}\n*{trigger}*",
+        color=0x57F287,
     )
-    embed.add_field(name="Results", value=f"Checked **{scanned:,}** items · **{qualified}** qualified", inline=False)
+    embed.add_field(
+        name="📊 Stats",
+        value=f"Checked **{scanned:,}** items  ·  **{qualified}** qualified",
+        inline=False,
+    )
     if not items:
-        embed.add_field(name="No Results", value="Nothing matched. Try raising `max_price` or lowering `min_gap`.", inline=False)
+        embed.add_field(
+            name="No Results",
+            value="Nothing matched. Try raising `max_price` or lowering `min_gap`.",
+            inline=False,
+        )
+        embed.set_footer(text="Tip: /scan max_price:500 to broaden the search")
         return embed
     for i, item in enumerate(items, 1):
-        embed.add_field(name=f"{i}. {item['name']}", value=_item_line(item), inline=False)
-    embed.set_footer(text="Gap = (Value − RAP) / Value × 100  |  Positive = potential upside")
+        n, v = _fmt_item(item, rank=i, show_score=True)
+        embed.add_field(name=n, value=v, inline=False)
+    embed.set_footer(text="Gap = (Value − RAP) / Value × 100  ·  Positive gap = potential upside")
     return embed
 
 
-def build_new_releases_embed(items: List[Dict]) -> discord.Embed:
-    now   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+def build_new_releases_embed(items):
+    now   = datetime.now(timezone.utc).strftime("%d %b %Y · %H:%M UTC")
     embed = discord.Embed(
-        title="🆕 Newest Limiteds",
-        description=(
-            f"Sorted by asset ID (higher = more recently created on Roblox) · {now}\n"
-            "Use `/forsale` to see which of these you can buy right now."
-        ),
-        color=discord.Color.gold(),
+        title="🆕  New Limiteds",
+        description=f"Most recently created · {now}\nUse `/forsale` to see what you can buy right now",
+        color=0xFEE75C,
     )
     if not items:
         embed.add_field(name="No Data", value="Could not fetch from Rolimons.", inline=False)
         return embed
     for i, item in enumerate(items, 1):
-        embed.add_field(name=f"{i}. {item['name']}", value=_item_line(item), inline=False)
+        n, v = _fmt_item(item, rank=i)
+        embed.add_field(name=n, value=v, inline=False)
+    embed.set_footer(text="Sorted by asset ID · higher ID = newer item")
     return embed
 
 
-def build_forsale_embed(items: List[Dict]) -> discord.Embed:
-    now   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+def build_forsale_embed(items):
+    now   = datetime.now(timezone.utc).strftime("%d %b %Y · %H:%M UTC")
     embed = discord.Embed(
-        title="🛒 Limiteds On Sale from Roblox Right Now",
-        description=f"Ranked by buy score · {now}",
-        color=discord.Color.blue(),
+        title="🛒  For Sale Right Now",
+        description=f"Limiteds purchaseable directly from Roblox · {now}",
+        color=0x5865F2,
     )
     if not items:
         embed.add_field(
             name="None Found",
-            value=(
-                "Roblox catalog returned no for-sale limiteds.\n"
-                "Railway's IP may be temporarily rate-limited. Try again in a few minutes."
-            ),
+            value="Roblox catalog returned nothing.\nRailway's IP may be rate-limited — try again in a few minutes.",
             inline=False,
         )
         return embed
 
-    best = items[0]
-    stock_note = f"  |  **{best.get('stock_remaining', '?')} left in stock**" if best.get("stock_remaining") is not None else ""
+    best       = items[0]
+    stock_note = f"\n📦 **{best.get('stock_remaining')} left in stock**" if best.get("stock_remaining") is not None else ""
+    desc_note  = f"\n*{best['description']}*" if best.get("description") else ""
     embed.add_field(
-        name=f"⭐ BEST BUY → {best['name']}",
+        name=f"⭐  BEST BUY  ·  {best['name']}",
         value=(
-            f"{buy_reason(best)}\n"
-            f"**Sale: {best['sale_price']} R$** | RAP: {int(best['rap'])} | "
-            f"Value: {int(best['value'])} | Score: {best['score']:.1f}{stock_note}\n"
-            + (f"*{best['description']}*\n" if best.get("description") else "")
-            + f"[🛒 Buy on Roblox](https://www.roblox.com/catalog/{best['id']})"
+            f"{buy_reason(best)}{stock_note}{desc_note}\n"
+            f"🏷️ **{best['sale_price']:,} R$**  ·  `RAP` {int(best['rap']):,}  ·  "
+            f"`Val` {int(best['value']):,}  ·  `Gap` {best['gap']:.1f}%\n"
+            f"[🛒 Buy on Roblox](https://www.roblox.com/catalog/{best['id']})"
         ),
         inline=False,
     )
+    embed.add_field(name="\u200b", value="**Other picks:**", inline=False)
     for i, item in enumerate(items[1:9], 2):
-        embed.add_field(name=f"{i}. {item['name']}", value=_item_line(item), inline=False)
-    embed.set_footer(text="Score = gap + demand + trend + bonuses  |  Higher = better")
+        n, v = _fmt_item(item, rank=i, show_score=True)
+        embed.add_field(name=n, value=v, inline=False)
+    embed.set_footer(text="Score = gap + demand + trend + bonuses  ·  Higher = better")
     return embed
+
+
+def build_growth_embed(items):
+    now   = datetime.now(timezone.utc).strftime("%d %b %Y · %H:%M UTC")
+    embed = discord.Embed(
+        title="🚀  Top 10 — Growth Potential",
+        description=(
+            f"Items most likely to gain RAP / trade value over time · {now}\n"
+            "Scored by trend direction, demand, rarity, hype, and value gap"
+        ),
+        color=0x9B59B6,
+    )
+    if not items:
+        embed.add_field(name="No Data", value="Could not score items.", inline=False)
+        return embed
+    for i, item in enumerate(items, 1):
+        n, v = _fmt_item(item, rank=i, show_score=True, score_key="growth_score")
+        # Append growth reason as a second line under the links
+        name_with_reason = n
+        value_with_reason = v + f"\n{growth_reason(item)}"
+        embed.add_field(name=name_with_reason, value=value_with_reason, inline=False)
+    embed.set_footer(text="Growth score ≠ guaranteed profit · always research before buying")
+    return embed
+
 
 
 def build_buynow_embed(item: Dict) -> discord.Embed:
@@ -666,8 +798,10 @@ async def hourly_loop():
             async with aiohttp.ClientSession() as session:
                 forsale_items = await fetch_forsale_limiteds(session)
                 new_items     = await fetch_new_releases(session)
+            growth_items = await run_growth_scan(top_n=10)
             await channel.send(embed=build_forsale_embed(forsale_items))
             await channel.send(embed=build_new_releases_embed(new_items))
+            await channel.send(embed=build_growth_embed(growth_items))
         await asyncio.sleep(SCAN_INTERVAL)
 
 
@@ -804,6 +938,15 @@ async def item_cmd(interaction: discord.Interaction, name: str):
     embed.add_field(name="Verdict", value=buy_reason(item), inline=False)
     embed.add_field(name="Links", value=f"[📊 Rolimons](https://www.rolimons.com/item/{item['id']})  • [🛒 Roblox](https://www.roblox.com/catalog/{item['id']})", inline=False)
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(name="top", description="Top 10 limiteds most likely to gain RAP / trade value", guild=discord.Object(id=GUILD_ID))
+async def top_cmd(interaction: discord.Interaction):
+    await interaction.response.send_message("🚀 Calculating growth potential...", ephemeral=True)
+    items = await run_growth_scan(top_n=10)
+    channel = await _get_channel()
+    if channel:
+        await channel.send(embed=build_growth_embed(items))
 
 
 # ================== STARTUP ==================
